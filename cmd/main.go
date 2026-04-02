@@ -11,6 +11,7 @@ import (
 
 	"github.com/duckstream/duckstream/internal/config"
 	"github.com/duckstream/duckstream/internal/duckdb"
+	"github.com/duckstream/duckstream/internal/httpapi"
 	"github.com/duckstream/duckstream/internal/query"
 	"github.com/duckstream/duckstream/internal/quic"
 	"github.com/duckstream/duckstream/internal/repl"
@@ -20,10 +21,10 @@ type sender struct {
 	server *quic.Server
 }
 
-func (s *sender) SendToStream(streamID string, data []byte) error {
+func (s *sender) SendToQuery(queryID string, data []byte) error {
 	sessions := s.server.GetSessions()
 	for _, session := range sessions {
-		if err := session.SendToStream(streamID, data); err == nil {
+		if err := session.SendToQuery(queryID, data); err == nil {
 			return nil
 		}
 	}
@@ -42,10 +43,10 @@ func main() {
 	}
 	defer client.Close()
 
-	quicServer := quic.NewServer(cfg.QUICAddr)
+	quicServer := quic.NewServer(cfg.QUICAddr, cfg)
 	sender := &sender{server: quicServer}
 
-	manager := query.NewManager(client, sender)
+	manager := query.NewManager(client, sender, cfg.MaxQueries)
 
 	go func() {
 		if err := quicServer.Start(ctx); err != nil {
@@ -54,11 +55,16 @@ func main() {
 	}()
 
 	ingestHandler := duckdb.NewIngestHandler(client, cfg)
+	apiHandler := httpapi.NewHandler(manager)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ingest", ingestHandler.Handle)
+	apiHandler.RegisterRoutes(mux)
+
 	go func() {
-		http.HandleFunc("/ingest", ingestHandler.Handle)
-		log.Printf("Ingest server listening on %s", cfg.IngestAddr)
-		if err := http.ListenAndServe(cfg.IngestAddr, nil); err != nil {
-			log.Printf("Ingest server error: %v", err)
+		log.Printf("HTTP server listening on %s", cfg.IngestAddr)
+		if err := http.ListenAndServe(cfg.IngestAddr, mux); err != nil {
+			log.Printf("HTTP server error: %v", err)
 		}
 	}()
 

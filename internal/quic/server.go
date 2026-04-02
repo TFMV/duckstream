@@ -12,9 +12,12 @@ import (
 	"math/big"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
+
+	"github.com/duckstream/duckstream/internal/config"
 )
 
 type Server struct {
@@ -25,13 +28,23 @@ type Server struct {
 	sessions  map[string]*Session
 	onConnect func(streamID string) error
 	onData    func(streamID string, data []byte)
+
+	maxClients          int
+	activeClients       atomic.Int64
+	maxStreamsPerClient int
 }
 
-func NewServer(addr string) *Server {
+func NewServer(addr string, cfg *config.Config) *Server {
 	return &Server{
-		addr:     addr,
-		sessions: make(map[string]*Session),
+		addr:                addr,
+		sessions:            make(map[string]*Session),
+		maxClients:          cfg.MaxClients,
+		maxStreamsPerClient: cfg.MaxStreamsPerClient,
 	}
+}
+
+func (s *Server) CanAccept() bool {
+	return int(s.activeClients.Load()) < s.maxClients
 }
 
 func (s *Server) SetOnConnect(f func(streamID string) error) {
@@ -73,7 +86,14 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			return
 		}
 
-		session := NewSession(conn, s)
+		if !s.CanAccept() {
+			_ = conn.CloseWithError(0, "max clients reached")
+			continue
+		}
+
+		s.activeClients.Add(1)
+
+		session := NewSession(conn, s, s.maxStreamsPerClient)
 		s.mu.Lock()
 		s.sessions[session.ID()] = session
 		s.mu.Unlock()
@@ -86,6 +106,7 @@ func (s *Server) RemoveSession(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, id)
+	s.activeClients.Add(-1)
 }
 
 func (s *Server) GetSessions() []*Session {
@@ -96,6 +117,10 @@ func (s *Server) GetSessions() []*Session {
 		sessions = append(sessions, session)
 	}
 	return sessions
+}
+
+func (s *Server) ActiveClients() int {
+	return int(s.activeClients.Load())
 }
 
 func (s *Server) Close() error {
@@ -156,19 +181,22 @@ func generateCert() ([]byte, []byte, error) {
 }
 
 type Session struct {
-	conn    *quic.Conn
-	server  *Server
-	id      string
-	mu      sync.RWMutex
-	streams map[quic.StreamID]*Stream
+	conn          *quic.Conn
+	server        *Server
+	id            string
+	mu            sync.RWMutex
+	streams       map[string]*Stream
+	maxStreams    int
+	activeStreams atomic.Int64
 }
 
-func NewSession(conn *quic.Conn, server *Server) *Session {
+func NewSession(conn *quic.Conn, server *Server, maxStreams int) *Session {
 	return &Session{
-		conn:    conn,
-		server:  server,
-		id:      conn.RemoteAddr().String(),
-		streams: make(map[quic.StreamID]*Stream),
+		conn:       conn,
+		server:     server,
+		id:         conn.RemoteAddr().String(),
+		streams:    make(map[string]*Stream),
+		maxStreams: maxStreams,
 	}
 }
 
@@ -176,8 +204,15 @@ func (s *Session) ID() string {
 	return s.id
 }
 
+func (s *Session) CanOpenStream() bool {
+	return int(s.activeStreams.Load()) < s.maxStreams
+}
+
 func (s *Session) Run(ctx context.Context) {
-	defer s.server.RemoveSession(s.ID())
+	defer func() {
+		s.server.RemoveSession(s.ID())
+		s.server.activeClients.Add(-1)
+	}()
 
 	for {
 		stream, err := s.conn.AcceptStream(ctx)
@@ -186,7 +221,7 @@ func (s *Session) Run(ctx context.Context) {
 		}
 
 		s.mu.Lock()
-		s.streams[stream.StreamID()] = NewStream(stream)
+		s.streams[fmt.Sprintf("%d", stream.StreamID())] = NewStream(stream)
 		s.mu.Unlock()
 
 		if s.server.onData != nil {
@@ -196,7 +231,12 @@ func (s *Session) Run(ctx context.Context) {
 }
 
 func (s *Session) handleStream(stream *quic.Stream) {
-	defer stream.Close()
+	defer func() {
+		stream.Close()
+		s.activeStreams.Add(-1)
+	}()
+
+	s.activeStreams.Add(1)
 
 	buf := make([]byte, 4096)
 	for {
@@ -211,6 +251,10 @@ func (s *Session) handleStream(stream *quic.Stream) {
 }
 
 func (s *Session) OpenStreamSync(ctx context.Context) (*quic.Stream, error) {
+	if !s.CanOpenStream() {
+		return nil, fmt.Errorf("max streams per client reached")
+	}
+	s.activeStreams.Add(1)
 	return s.conn.OpenStreamSync(ctx)
 }
 
@@ -224,17 +268,43 @@ func (s *Session) Close() error {
 
 func (s *Session) SendToStream(streamID string, data []byte) error {
 	s.mu.RLock()
-	stream, ok := s.streams[quic.StreamID(0)]
+	stream, ok := s.streams[streamID]
 	s.mu.RUnlock()
 
 	if !ok {
-		qstream, err := s.conn.OpenStreamSync(context.Background())
+		qstream, err := s.OpenStreamSync(context.Background())
 		if err != nil {
 			return err
 		}
 		stream = NewStream(qstream)
 		s.mu.Lock()
-		s.streams[qstream.StreamID()] = stream
+		s.streams[fmt.Sprintf("%d", qstream.StreamID())] = stream
+		s.mu.Unlock()
+	}
+
+	_, err := stream.Write(data)
+	return err
+}
+
+func (s *Session) SendToQuery(queryID string, data []byte) error {
+	if !s.CanOpenStream() {
+		return fmt.Errorf("max streams per client reached")
+	}
+
+	streamKey := "query:" + queryID
+
+	s.mu.RLock()
+	stream, ok := s.streams[streamKey]
+	s.mu.RUnlock()
+
+	if !ok {
+		qstream, err := s.OpenStreamSync(context.Background())
+		if err != nil {
+			return err
+		}
+		stream = NewStream(qstream)
+		s.mu.Lock()
+		s.streams[streamKey] = stream
 		s.mu.Unlock()
 	}
 

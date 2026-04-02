@@ -56,5 +56,5 @@ func EncodeHeartbeat() []byte {
 }
 
 type Sender interface {
-	SendToStream(streamID string, data []byte) error
+	SendToQuery(queryID string, data []byte) error
 }

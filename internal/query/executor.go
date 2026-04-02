@@ -10,6 +10,7 @@ import (
 
 	"github.com/duckstream/duckstream/internal/config"
 	"github.com/duckstream/duckstream/internal/duckdb"
+	"github.com/duckstream/duckstream/internal/metrics"
 	"github.com/duckstream/duckstream/internal/protocol"
 )
 
@@ -71,7 +72,7 @@ func (e *Executor) run(ctx context.Context, sql string) {
 			e.sendError("context cancelled")
 			return
 		case <-e.stopCh:
-			_ = e.sender.SendToStream(e.streamID, protocol.EncodeCompleted())
+			_ = e.sender.SendToQuery(e.queryID, protocol.EncodeCompleted())
 			return
 		case <-ticker.C:
 			e.poll(ctx, sql)
@@ -131,14 +132,20 @@ func (e *Executor) poll(ctx context.Context, sql string) {
 	if len(rowMaps) > 0 {
 		data, err := protocol.EncodeRowBatch(rowMaps)
 		if err != nil {
+			metrics.IncErrors()
 			return
 		}
-		_ = e.sender.SendToStream(e.streamID, data)
+		if err := e.sender.SendToQuery(e.streamID, data); err != nil {
+			metrics.IncErrors()
+			return
+		}
+		metrics.IncRowsSent(int64(len(rowMaps)))
 	}
 }
 
 func (e *Executor) sendError(msg string) {
-	_ = e.sender.SendToStream(e.streamID, protocol.EncodeError(msg))
+	_ = e.sender.SendToQuery(e.streamID, protocol.EncodeError(msg))
+	metrics.IncErrors()
 }
 
 func (e *Executor) Stop() {
