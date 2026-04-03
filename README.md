@@ -145,3 +145,40 @@ Default configuration in `internal/config/config.go`:
 - Execution is a live cursor that never naturally terminates
 - QUIC delivers output streams to clients
 - Queries run continuously until explicitly unregistered
+
+## Limitations
+
+### Current Architecture Trade-offs
+
+1. **Polling-Based, Not Change Data Capture**
+   - The system uses incremental polling (`WHERE id > lastID`) every 100ms
+   - This is not real-time streaming like CDC (Change Data Capture)
+   - There is inherent latency between when a row is inserted and when it's delivered
+
+2. **Requires `id` Column for Incremental Streaming**
+   - For tables with an `id` column (auto-incrementing), the system tracks position and delivers only new rows
+   - For tables without `id` or with non-sequential IDs, **all rows are re-sent on every poll**
+   - This works: `SELECT * FROM events WHERE id > 0` (incremental)
+   - This re-sends everything: `SELECT * FROM orders WHERE created_at > '...'` (full poll each time)
+
+3. **Aggregation Queries Re-compute Entire Result**
+   - Queries like `SELECT sum(sale_amt) FROM sales` will re-run completely each poll
+   - The entire aggregation is re-sent, not just the delta
+   - For high-frequency inserts, this means sending the same aggregate repeatedly
+
+4. **No Native Support for Arbitrary SQL Streaming**
+   - Not all SQL queries can be efficiently streamed
+   - Complex JOINs, window functions, and subqueries may not behave as expected
+   - The system is optimized for simple filtered views of append-only tables
+
+### What Works Well
+
+- `SELECT * FROM table WHERE id > N` - incremental row delivery
+- `SELECT * FROM events WHERE data->>'type' = 'click'` - filtered incremental
+- Any query on tables with auto-incrementing `id` column
+
+### What Doesn't Work Well (Or At All)
+
+- `SELECT sum(amount) FROM sales` - re-sends entire aggregate each poll
+- `SELECT * FROM table WHERE timestamp > X` - no timestamp tracking, full re-send
+- Complex queries without stable `id` column for position tracking

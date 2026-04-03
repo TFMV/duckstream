@@ -2,7 +2,6 @@ package query
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"sync"
@@ -23,6 +22,7 @@ type Executor struct {
 	mu      sync.RWMutex
 	running bool
 	lastID  int64
+	lastSQL string
 	stopCh  chan struct{}
 }
 
@@ -31,21 +31,10 @@ func NewExecutor(client *duckdb.Client, sender protocol.Sender, queryID string) 
 		client:   client,
 		sender:   sender,
 		queryID:  queryID,
-		streamID: hashToStreamID(queryID),
+		streamID: "query:" + queryID,
 		running:  false,
 		stopCh:   make(chan struct{}),
 	}
-}
-
-func hashToStreamID(queryID string) string {
-	h := sha256Hash(queryID)
-	return h[:8]
-}
-
-func sha256Hash(s string) string {
-	h := sha256.New()
-	h.Write([]byte(s))
-	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func (e *Executor) Start(ctx context.Context, sql string) {
@@ -56,6 +45,7 @@ func (e *Executor) Start(ctx context.Context, sql string) {
 	}
 	e.running = true
 	e.lastID = 0
+	e.lastSQL = sql
 	e.stopCh = make(chan struct{})
 	e.mu.Unlock()
 
@@ -72,7 +62,7 @@ func (e *Executor) run(ctx context.Context, sql string) {
 			e.sendError("context cancelled")
 			return
 		case <-e.stopCh:
-			_ = e.sender.SendToQuery(e.queryID, protocol.EncodeCompleted())
+			_ = e.sender.SendToQuery(e.streamID, protocol.EncodeCompleted())
 			return
 		case <-ticker.C:
 			e.poll(ctx, sql)
@@ -85,7 +75,7 @@ func (e *Executor) poll(ctx context.Context, sql string) {
 	lastID := e.lastID
 	e.mu.RUnlock()
 
-	query := fmt.Sprintf("SELECT * FROM (%s) WHERE id > %d ORDER BY id", sql, lastID)
+	query := fmt.Sprintf("SELECT * FROM (%s) AS subq", sql)
 	rows, err := e.client.DB().QueryContext(ctx, query)
 	if err != nil {
 		e.sendError(fmt.Sprintf("query error: %v", err))
@@ -97,6 +87,79 @@ func (e *Executor) poll(ctx context.Context, sql string) {
 	if err != nil {
 		return
 	}
+
+	hasID := false
+	for _, col := range cols {
+		if col == "id" {
+			hasID = true
+			break
+		}
+	}
+
+	if hasID {
+		e.pollIncremental(ctx, cols, lastID)
+	} else {
+		e.pollFull(ctx, sql)
+	}
+}
+
+func (e *Executor) pollFull(ctx context.Context, sql string) {
+	rows, err := e.client.DB().QueryContext(ctx, sql)
+	if err != nil {
+		e.sendError(fmt.Sprintf("query error: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return
+	}
+
+	values := make([][]byte, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var rowMaps []map[string]interface{}
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+		row := make(map[string]interface{})
+		for i, col := range cols {
+			row[col] = string(values[i])
+		}
+		rowMaps = append(rowMaps, row)
+	}
+
+	if len(rowMaps) > 0 {
+		data, err := protocol.EncodeRowBatch(rowMaps)
+		if err != nil {
+			metrics.IncErrors()
+			return
+		}
+		if err := e.sender.SendToQuery(e.streamID, data); err != nil {
+			metrics.IncErrors()
+			return
+		}
+		metrics.IncRowsSent(int64(len(rowMaps)))
+	}
+}
+
+func (e *Executor) pollIncremental(ctx context.Context, cols []string, lastID int64) {
+	e.mu.RLock()
+	sql := e.lastSQL
+	e.mu.RUnlock()
+
+	query := fmt.Sprintf("SELECT * FROM (%s) WHERE id > %d ORDER BY id", sql, lastID)
+	rows, err := e.client.DB().QueryContext(ctx, query)
+	if err != nil {
+		e.sendError(fmt.Sprintf("query error: %v", err))
+		return
+	}
+	defer rows.Close()
 
 	values := make([][]byte, len(cols))
 	valuePtrs := make([]interface{}, len(cols))

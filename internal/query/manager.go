@@ -54,7 +54,7 @@ func (m *Manager) Register(ctx context.Context, id, sql string) error {
 		return fmt.Errorf("%w: %v", ErrInvalidQuery, err)
 	}
 
-	queryCtx, cancel := context.WithCancel(ctx)
+	queryCtx, cancel := context.WithCancel(context.Background())
 	exec := NewExecutor(m.client, m.sender, id)
 	exec.Start(queryCtx, sql)
 
