@@ -4,14 +4,12 @@ Welcome to DuckStream documentation. Here's a quick overview of the available gu
 
 ## Getting Started
 
-- **[Quick Start](./README.md)** - Get up and running quickly
-- **[Architecture](./docs/architecture.md)** - System design and component interactions
-- **[API Reference](./docs/api.md)** - HTTP API endpoint documentation
+- **[Architecture](architecture.md)** - System design and component interactions
+- **[API Reference](api.md)** - HTTP API endpoint documentation
 
 ## Usage
 
-- **[Query Language](./docs/queries.md)** - SQL query patterns and examples
-- **[Configuration](./docs/configuration.md)** - Customizing server behavior
+- **[Configuration](configuration.md)** - Customizing server behavior
 
 ## Guides
 
