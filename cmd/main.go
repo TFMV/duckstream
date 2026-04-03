@@ -48,7 +48,7 @@ func main() {
 	quicServer := quic.NewServer(cfg.QUICAddr, cfg)
 	sender := &sender{server: quicServer}
 
-	manager := query.NewManager(client, sender, cfg.MaxQueries)
+	manager := query.NewManager(client, sender, cfg)
 
 	go func() {
 		if err := quicServer.Start(ctx); err != nil {

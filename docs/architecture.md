@@ -95,20 +95,137 @@ stateDiagram-v2
     [*] --> Idle
     
     Idle --> Validating: REGISTER QUERY q1 AS ...
-    Validating --> Running: SQL valid
-    Validating --> Error: SQL invalid
     
-    Running --> Polling: Start executor
-    Polling --> Polling: id > lastID
+    Validating --> ParseSQL: Parse SQL statement
+    ParseSQL --> CheckConstraints: Validate single-table, no JOIN/GROUP/DISTINCT/OVER
+    CheckConstraints --> ValidateTable: Verify table exists
+    ValidateTable --> DetectCursor: Auto-detect cursor (id or created_at)
+    DetectCursor --> ValidateCursorType: Verify cursor is BIGINT or TIMESTAMP
+    ValidateCursorType --> BuildStreamPlan: Create StreamPlan with SQL, cursor, mode
+    
+    BuildStreamPlan --> Running: StreamPlan valid
+    
+    DetectCursor --> Error: Cursor not found
+    ValidateCursorType --> Error: Cursor type invalid
+    CheckConstraints --> Error: Forbidden construct detected
+    ValidateTable --> Error: Table doesn't exist
+    
+    Running --> Initializing: Executor starts
+    Initializing --> DetermineStart: Apply start mode (BEGINNING/NOW)
+    DetermineStart --> Polling: Initialize cursor value
+    Polling --> Polling: Poll every 100ms: WHERE cursor > value
     Polling --> Streaming: New rows found
     
-    Streaming --> Delivering: Send over QUIC
-    Delivering --> Polling: Done
+    Streaming --> Delivering: Send over QUIC (at-least-once)
+    Delivering --> CursorAdvance: Advance cursor past sent rows
+    CursorAdvance --> Polling: Continue polling
     
     Running --> Stopped: UNREGISTER QUERY
     Stopped --> [*]
     Error --> [*]
 ```
+
+### Query Compilation (StreamPlan)
+
+The **StreamPlan** is the compiled representation of a query, created during registration:
+
+1. **SQL Parsing**: Extract table name, columns, WHERE clause from SELECT statement
+2. **Constraint Validation**: Reject JOINs, GROUP BY, DISTINCT, window functions, subqueries
+3. **Table Resolution**: Verify table exists in DuckDB and is accessible
+4. **Cursor Detection**: Auto-detect monotonic cursor (`id` BIGINT → preferred, `created_at` TIMESTAMP → fallback)
+5. **Cursor Validation**: Verify cursor column exists and is BIGINT or TIMESTAMP
+6. **SQL Building**: Construct parameterized polling query `SELECT ... WHERE <cursor> > ?`
+7. **Stream State Initialization**: Prepare cursor value based on start mode (BEGINNING/NOW)
+
+### Query State and Metrics
+
+- **StreamState** tracked per query in `Executor`:
+  - `CursorValue` (`int64` for BIGINT or `time.Time` for TIMESTAMP)
+  - `RowsSent` (streamed rows count)
+  - `LastUpdateAt` (last emitted update timestamp)
+  - `InitializedAt` (stream initialization moment)
+- `Manager.GetAllQueryStates()` exposes active states.
+- `/metrics` includes per-query block:
+  - `id`, `last_cursor`, `rows_streamed`, `lag_ms` (computed for TIMESTAMP cursor)
+
+### SQL Validation & Error Handling
+
+DuckStream performs strict SQL validation at registration time to ensure queries can be safely and efficiently streamed. All validation errors are explicit and fail fast:
+
+#### Validation Rules
+
+**1. Single-Table SELECT Enforcement**
+
+```
+Error: "only single-table SELECT queries are supported"
+Details: Query specifies multiple tables (detected by parsing FROM clause or JOIN keywords)
+```
+
+**2. JOIN Rejection**
+
+```
+Error: "JOINs are not supported in streaming queries"
+Details: All join types (INNER, LEFT, RIGHT, FULL, CROSS) are forbidden
+Reason: Streaming requires independent cursor tracking per table; joins break this property
+```
+
+**3. GROUP BY Rejection**
+
+```
+Error: "GROUP BY is not supported in streaming queries"
+Details: Aggregation queries (COUNT, SUM, AVG, GROUP_CONCAT, etc.) after GROUP BY are forbidden
+Reason: Aggregations re-compute entire results on each poll; no incremental semantics possible
+```
+
+**4. DISTINCT Rejection**
+
+```
+Error: "DISTINCT is not supported"
+Details: DISTINCT keyword in SELECT clause is forbidden
+Reason: Requires buffering all rows to eliminate duplicates; breaks streaming
+```
+
+**5. Window Function Rejection**
+
+```
+Error: "Window functions are not supported"
+Details: OVER(...) window function syntax in SELECT expressions is forbidden
+Reason: Complex per-row computations require buffering; incompatible with cursor-based streaming
+```
+
+**6. Subquery Rejection**
+
+```
+Error: "Subqueries are not supported"
+Details: Nested SELECT queries in FROM, WHERE, or SELECT clauses are forbidden
+Reason: Subqueries complicate cursor tracking and incremental execution
+```
+
+**7. Cursor Column Discovery**
+
+```
+Error: "no valid cursor column found (expected id or created_at)"
+Details: After all other validations pass, DuckStream searches for a cursor column:
+  - First: Look for `id` (BIGINT type required)
+  - Second: Look for `created_at` (TIMESTAMP type required)
+  - None found: Registration fails
+```
+
+**8. Cursor Type Validation**
+
+```
+Error: "cursor column must be BIGINT or TIMESTAMP"
+Details: If cursor column found but wrong type (e.g., VARCHAR, INT, NUMERIC):
+  - BIGINT: Supports auto-incrementing sequences and numeric IDs
+  - TIMESTAMP: Supports monotonic insertion time tracking
+  - Other types: Insufficient guarantees for incremental delivery
+```
+
+#### Online vs. Upfront Validation
+
+- **Upfront Validation (Registration Time)**: All constraints above are checked when `REGISTER QUERY` is issued
+- **Online Detection (Runtime)**: Per-query metrics and cursor state are tracked during execution
+- **No Runtime SQL Errors**: If a query passes registration, it will never fail during polling (assuming data integrity)
 
 ## Internal Components
 

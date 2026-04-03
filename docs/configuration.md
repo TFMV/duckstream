@@ -42,6 +42,20 @@ go run ./cmd/main.go
 
 ## Tuning Guidelines
 
+### Cursor Polling Frequency
+
+The `PollInterval` controls how often each registered query checks for new rows:
+
+```go
+&Config{
+    PollInterval: 100 * time.Millisecond,  // Default: 100ms
+}
+```
+
+- **Lower interval** (e.g., 50ms): More responsive streaming, higher CPU
+- **Higher interval** (e.g., 500ms): Lower CPU, higher latency (0–500ms delay)
+- **Cursor state impact**: Each poll advances the query's cursor; lower intervals update metrics more frequently
+
 ### High-Throughput Ingestion
 
 If you're ingesting many events per second:

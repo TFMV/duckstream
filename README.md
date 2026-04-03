@@ -54,23 +54,85 @@ curl http://localhost:8080/metrics
 
 ## Features
 
-### Query Validation
-Invalid SQL is rejected before creating an executor:
+### SQL Query Validation
+Queries are validated against strict rules at registration time. Invalid SQL is rejected before creating an executor with explicit error messages:
+
 ```bash
+# Single-table queries only
 curl -X POST http://localhost:8080/queries \
   -H "Content-Type: application/json" \
-  -d '{"id":"bad","sql":"SELECT * FROM nonexistent"}'
-# Returns: invalid query: table does not exist
+  -d '{"id":"q1","sql":"SELECT * FROM lineitem"}'
+
+# JOINs are rejected
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"bad","sql":"SELECT * FROM lineitem JOIN orders"}'
+# Returns: invalid query: JOINs are not supported in streaming queries
+
+# GROUP BY is rejected
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"bad","sql":"SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id"}'
+# Returns: invalid query: GROUP BY is not supported
+
+# Cursor column must exist and be BIGINT or TIMESTAMP
+# Valid: id (BIGINT) or created_at (TIMESTAMP)
+# Invalid: SELECT * FROM orders WHERE timestamp > X (no cursor column tracking)
 ```
 
-### Metrics Endpoint
-Tracks:
-- `queries_registered` - total queries registered
-- `queries_unregistered` - total queries unregistered  
-- `rows_sent` - total rows streamed
-- `errors` - total errors
-- `active_clients` - current QUIC connections
-- `active_queries` - current running queries
+### Per-Query Metrics Endpoint
+The `/metrics` endpoint now returns comprehensive per-query streaming metrics:
+
+```bash
+curl http://localhost:8080/metrics | jq .
+```
+
+Response includes:
+- Global metrics: `queries_registered`, `queries_unregistered`, `rows_sent`, `errors`
+- Connection stats: `active_clients`, `active_queries`
+- Per-query metrics (array):
+  - `id` - query identifier
+  - `last_cursor` - current cursor position (int64 or timestamp)
+  - `rows_streamed` - rows sent for this query
+  - `lag_ms` - milliseconds behind current state (for TIMESTAMP cursor only)
+
+Example per-query metric:
+```json
+{
+  "id": "lineitem_stream",
+  "last_cursor": "2026-04-03T12:34:56Z",
+  "rows_streamed": 120,
+  "lag_ms": 520
+}
+```
+
+### Start Modes
+When registering a query, specify where to start streaming from:
+
+```bash
+# Start from the beginning (default)
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"q1","sql":"SELECT * FROM lineitem","mode":"BEGINNING"}'
+
+# Start from now (skip existing rows, only stream new inserts)
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"q1","sql":"SELECT * FROM lineitem","mode":"NOW"}'
+
+# REPL syntax
+> REGISTER QUERY q1 AS SELECT * FROM lineitem FROM NOW
+> REGISTER QUERY q2 AS SELECT * FROM lineitem WITH CURSOR created_at FROM NOW
+```
+
+### Cursor Column Selection
+The system automatically detects the cursor column for incremental polling:
+1. Uses explicit `cursor` parameter if provided
+2. Falls back to `id` column if present
+3. Falls back to `created_at` column if present
+4. Fails with clear error if neither found
+
+Cursor column must be `BIGINT` or `TIMESTAMP` type.
 
 ### Connection Limits (Sane Defaults)
 - Max clients: 100
@@ -92,30 +154,40 @@ Open `frontend/index.html` in a browser for a live dashboard with:
 
 ## How It Works
 
-**The Core Concept:** Think of `events` as an infinite append-only log. Each registered query is like subscribing to a filtered view of that log. New events are continuously delivered to all active subscribers.
+**The Core Concept:** Each registered query polls its source table incrementally, tracking the last cursor position (an auto-incrementing `id` or `created_at` timestamp). New rows matching the query are continuously delivered over QUIC.
 
 **Step by Step:**
 
-1. **Data flows in**: Events are inserted into the `events` table via HTTP POST. Each event gets a unique auto-incrementing `id`.
+1. **Cursor Detection**: When you register a query, the system:
+   - Analyzes the table schema
+   - Auto-detects cursor column: `id` (int64) or `created_at` (timestamp), or accepts explicit cursor parameter
+   - Validates cursor type is BIGINT or TIMESTAMP
+   - Fails fast with clear error if no suitable cursor found
 
-2. **Queries run continuously**: When you register a query like `SELECT * FROM events WHERE data->>'event' = 'click'`, the system creates a long-running executor that:
-   - Remembers the last `id` it has seen
-   - Polls DuckDB every 100ms for "new rows where id > lastSeen"
-   - Sends any matching rows over QUIC to connected clients
+2. **Initialization**: Based on `StartMode`:
+   - `BEGINNING`: start from cursor value 0 (or epoch for timestamps)
+   - `NOW`: find current max cursor value, skip existing rows, stream only new inserts
 
-3. **Independent subscriptions**: Each query tracks its own position. You can register 10 different queries with different filters - they'll all run independently, each getting only the rows that match their filter.
+3. **Polling Loop** (every 100ms):
+   - Execute: `SELECT ... WHERE cursor > lastValue ORDER BY cursor ASC LIMIT batchSize`
+   - For each row, update cursor position
+   - Send batch over QUIC stream
+   - At-least-once delivery: only advance cursor after successful send
 
-4. **Streaming over QUIC**: Results flow over QUIC streams. Each query maps to a stream. Clients connect to the QUIC server and read from their stream to get continuous updates.
-
-5. **Explicit lifecycle**: Queries run forever (or until server stops). Use `UNREGISTER QUERY id` to stop a specific query and free its resources.
+4. **Per-Query State**:
+   - Each executor maintains `StreamState`: cursor position, rows sent, last update time
+   - State accessible via `/metrics` endpoint
 
 **Analogy:**
 ```
-events table     = a journal/log
-query            = a subscription to that journal with a filter
-executor         = a background worker that checks for new entries
-QUIC stream      = a delivery channel to the subscriber
+table               = append-only log with cursor column
+cursor column       = position marker (id or created_at)
+query               = subscription with WHERE filter
+executor            = background worker that polls incrementally
+QUIC stream         = delivery channel to client
 ```
+
+**Why Cursors:** Polling-based streaming requires a position anchor. Without a cursor column, the system would re-scan the entire table on every poll - inefficient and impractical at scale.
 
 ## Configuration
 
@@ -132,11 +204,32 @@ Default configuration in `internal/config/config.go`:
 
 ## REPL Commands
 
-- `REGISTER QUERY <id> AS <sql>` - Start streaming a query
+Basic:
+- `REGISTER QUERY <id> AS <sql>` - Start streaming from BEGINNING
 - `UNREGISTER QUERY <id>` - Stop streaming and remove query
 - `LIST QUERIES` - Show active queries
 - `HELP` - Show help
 - `QUIT` - Exit
+
+Extended syntax (with cursor and start mode):
+- `REGISTER QUERY <id> AS <sql> WITH CURSOR <column> FROM NOW`
+- `REGISTER QUERY <id> AS <sql> FROM NOW`
+- `REGISTER QUERY <id> AS <sql> WITH CURSOR <column>` (defaults to BEGINNING)
+
+Examples:
+```
+# Simple: stream all rows from lineitem table starting from beginning
+> REGISTER QUERY q1 AS SELECT * FROM lineitem
+
+# Skip existing, only new: start from the current max id
+> REGISTER QUERY q2 AS SELECT * FROM lineitem FROM NOW
+
+# Explicit cursor: use created_at timestamp instead of auto-detected id
+> REGISTER QUERY q3 AS SELECT * FROM lineitem WITH CURSOR created_at
+
+# Combine: use created_at and skip to current time
+> REGISTER QUERY q4 AS SELECT * FROM lineitem WITH CURSOR created_at FROM NOW
+```
 
 ## Behavior
 
@@ -148,37 +241,53 @@ Default configuration in `internal/config/config.go`:
 
 ## Limitations
 
-### Current Architecture Trade-offs
+### Design Constraints
 
-1. **Polling-Based, Not Change Data Capture**
-   - The system uses incremental polling (`WHERE id > lastID`) every 100ms
-   - This is not real-time streaming like CDC (Change Data Capture)
-   - There is inherent latency between when a row is inserted and when it's delivered
+DuckStream enforces strict SQL validation at registration time to ensure queries can be efficiently streamed. Attempts to register an invalid query fail immediately with explicit error messages:
 
-2. **Requires `id` Column for Incremental Streaming**
-   - For tables with an `id` column (auto-incrementing), the system tracks position and delivers only new rows
-   - For tables without `id` or with non-sequential IDs, **all rows are re-sent on every poll**
-   - This works: `SELECT * FROM events WHERE id > 0` (incremental)
-   - This re-sends everything: `SELECT * FROM orders WHERE created_at > '...'` (full poll each time)
+- **`only single-table SELECT queries are supported`** – Multi-table queries are not supported
+- **`JOINs are not supported in streaming queries`** – All join types (INNER, LEFT, CROSS, etc.) are rejected
+- **`GROUP BY is not supported in streaming queries`** – Aggregation queries are rejected because they re-compute entire results on each poll
+- **`DISTINCT is not supported`** – Requires buffering all rows to eliminate duplicates
+- **Window functions are not supported** – Complex per-row computations over result sets
+- **Subqueries are not supported** – Nested SELECT queries
+- **`no valid cursor column found (expected id or created_at)`** – Query must have an auto-incrementing `id` (BIGINT) or `created_at` (TIMESTAMP) column; if neither exists, registration fails
+- **`cursor column must be BIGINT or TIMESTAMP`** – Only these types support monotonic cursor tracking
 
-3. **Aggregation Queries Re-compute Entire Result**
-   - Queries like `SELECT sum(sale_amt) FROM sales` will re-run completely each poll
-   - The entire aggregation is re-sent, not just the delta
-   - For high-frequency inserts, this means sending the same aggregate repeatedly
+### Cursor Tracking & Latency
 
-4. **No Native Support for Arbitrary SQL Streaming**
-   - Not all SQL queries can be efficiently streamed
-   - Complex JOINs, window functions, and subqueries may not behave as expected
-   - The system is optimized for simple filtered views of append-only tables
+Once a query is registered, DuckStream polls the cursor column every 100ms:
+
+- **Polling latency**: 0–100ms delay between insert and delivery (depends on insert timing relative to poll tick)
+- **At-least-once semantics**: If connection drops after delivery, cursor is not advanced; rows are re-sent on reconnect
+- **Stateful cursor**: Each query maintains its own cursor position in the stream (persisted in memory; lost if server restarts)
 
 ### What Works Well
 
-- `SELECT * FROM table WHERE id > N` - incremental row delivery
-- `SELECT * FROM events WHERE data->>'type' = 'click'` - filtered incremental
-- Any query on tables with auto-incrementing `id` column
+- `SELECT * FROM events` – All rows with an `id` or `created_at` cursor
+- `SELECT id, type, data FROM events WHERE data->>'status' = 'active'` – Filtered incremental delivery
+- `SELECT * FROM audit_log WHERE timestamp > now() - interval 1 day` – Time-windowed queries
+- Tables with auto-incrementing `id` or `created_at` TIMESTAMP columns
 
-### What Doesn't Work Well (Or At All)
+### What Doesn't Work
 
-- `SELECT sum(amount) FROM sales` - re-sends entire aggregate each poll
-- `SELECT * FROM table WHERE timestamp > X` - no timestamp tracking, full re-send
+- `SELECT sum(amount) FROM sales` – Aggregations re-compute and re-send entire result on each poll
+- `SELECT e.id, u.name FROM events e JOIN users u ON e.user_id = u.id` – JOINs are rejected
+- `SELECT * FROM events GROUP BY type` – GROUP BY is rejected
+- `SELECT DISTINCT status FROM events` – DISTINCT is rejected
+- Arbitrary complex SQL – Window functions, subqueries, CTEs, and complex WHERE clauses may not work as expected
+
+### When to Use DuckStream
+
+- Real-time monitoring dashboards ingesting append-only log tables
+- Event stream processing where order matters and rows arrive incrementally
+- Sensor data feeds or metrics collection with monotonic timestamps
+- Use cases where all historical rows must be delivered to all clients
+
+### When NOT to Use DuckStream
+
+- Analytics queries over historical data (use batch query APIs instead)
+- Complex transformations requiring JOINs or aggregations (use DuckDB directly)
+- In-memory state tracking across many connected clients (server restart loses cursor state)
+- Extremely low-latency requirements (<100ms) – polling introduces inherent delay
 - Complex queries without stable `id` column for position tracking
