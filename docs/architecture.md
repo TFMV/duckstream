@@ -2,7 +2,7 @@
 
 ## System Overview
 
-DuckStream is a real-time streaming SQL engine built on DuckDB. It transforms SQL queries registered against an append-only events table into continuously running streams delivered over QUIC.
+DuckStream is a real-time streaming SQL engine built on DuckDB. It ingests events into a configurable `events` table by default at `/ingest`, and also supports table-specific ingestion on `/ingest/<table>`. Registered SQL queries can target any table that exposes a valid cursor column (e.g., `id` BIGINT or `created_at` TIMESTAMP), and are delivered as continuously running streams over QUIC.
 
 ## High-Level Architecture
 

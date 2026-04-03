@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,24 +39,53 @@ func (h *IngestHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	path := strings.TrimPrefix(r.URL.Path, "/ingest")
+	if path == "" || path == "/" {
+		// Default events endpoint
+		var req IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		event := Event{
+			Data:      req.Data,
+			Timestamp: time.Now(),
+		}
+
+		h.mu.Lock()
+		h.buffer = append(h.buffer, event)
+		shouldFlush := len(h.buffer) >= h.cfg.BatchSize || time.Since(h.lastFlush) >= h.cfg.BatchTimeout
+		h.mu.Unlock()
+
+		if shouldFlush {
+			h.flush()
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
+	// Table-targeted ingest: /ingest/<table>
+	table := strings.TrimPrefix(path, "/")
+	if table == "" {
+		http.Error(w, "table name required", http.StatusBadRequest)
+		return
+	}
+
 	var req IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	event := Event{
-		Data:      req.Data,
-		Timestamp: time.Now(),
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	h.mu.Lock()
-	h.buffer = append(h.buffer, event)
-	shouldFlush := len(h.buffer) >= h.cfg.BatchSize || time.Since(h.lastFlush) >= h.cfg.BatchTimeout
-	h.mu.Unlock()
-
-	if shouldFlush {
-		h.flush()
+	if err := h.client.InsertRow(ctx, table, req.Data); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)

@@ -73,6 +73,7 @@ func main() {
 	fs := http.FileServer(http.Dir(frontendDir))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest", ingestHandler.Handle)
+	mux.HandleFunc("/ingest/", ingestHandler.Handle)
 	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
