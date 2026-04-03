@@ -3,11 +3,9 @@ package duckdb
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"time"
 
-	"github.com/duckdb/duckdb-go/v2"
 	_ "github.com/duckdb/duckdb-go/v2"
 )
 
@@ -57,6 +55,11 @@ func (c *Client) Close() error {
 	return c.db.Close()
 }
 
+func (c *Client) Exec(ctx context.Context, sql string) error {
+	_, err := c.db.ExecContext(ctx, sql)
+	return err
+}
+
 type Event struct {
 	ID        int64
 	Data      string
@@ -68,40 +71,25 @@ func (c *Client) InsertEvents(ctx context.Context, events []Event) error {
 		return nil
 	}
 
-	conn, err := c.db.Conn(ctx)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("get conn: %w", err)
+		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = tx.Rollback() }()
 
-	var appendErr error
-	err = conn.Raw(func(driverConn any) error {
-		dc, ok := driverConn.(driver.Conn)
-		if !ok {
-			return fmt.Errorf("not a driver.Conn")
-		}
-		appender, err := duckdb.NewAppenderFromConn(dc, "", "events")
-		if err != nil {
-			return fmt.Errorf("create appender: %w", err)
-		}
-		defer appender.Close()
-
-		for _, e := range events {
-			if err := appender.AppendRow(e.Data, e.Timestamp); err != nil {
-				return fmt.Errorf("append row: %w", err)
-			}
-		}
-
-		if err := appender.Flush(); err != nil {
-			return fmt.Errorf("flush: %w", err)
-		}
-		return nil
-	})
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO events (data, timestamp) VALUES (?, ?)")
 	if err != nil {
-		return fmt.Errorf("raw: %w", err)
+		return fmt.Errorf("prepare: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, e := range events {
+		if _, err := stmt.ExecContext(ctx, e.Data, e.Timestamp); err != nil {
+			return fmt.Errorf("insert: %w", err)
+		}
 	}
 
-	return appendErr
+	return tx.Commit()
 }
 
 func (c *Client) MaxEventID(ctx context.Context) (int64, error) {

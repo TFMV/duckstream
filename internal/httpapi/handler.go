@@ -5,17 +5,62 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/duckstream/duckstream/internal/metrics"
 	"github.com/duckstream/duckstream/internal/query"
 )
 
 type Handler struct {
-	manager *query.Manager
+	manager   *query.Manager
+	quicStats interface{ ActiveClients() int }
+
+	eventSubs  map[*eventSub]bool
+	eventSubMu sync.RWMutex
+	querySubs  map[string]map[*querySub]bool
+	querySubMu sync.RWMutex
 }
 
-func NewHandler(manager *query.Manager) *Handler {
-	return &Handler{manager: manager}
+type eventSub struct {
+	ch chan string
+}
+
+type querySub struct {
+	id string
+	ch chan string
+}
+
+func NewHandler(manager *query.Manager, quicStats interface{ ActiveClients() int }) *Handler {
+	h := &Handler{
+		manager:   manager,
+		quicStats: quicStats,
+		eventSubs: make(map[*eventSub]bool),
+		querySubs: make(map[string]map[*querySub]bool),
+	}
+	go h.broadcastLoop()
+	return h
+}
+
+func (h *Handler) broadcastLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		queries := h.manager.List()
+		for _, q := range queries {
+			h.querySubMu.RLock()
+			subs := h.querySubs[q.ID]
+			h.querySubMu.RUnlock()
+
+			for sub := range subs {
+				select {
+				case sub.ch <- "ping":
+				default:
+				}
+			}
+		}
+	}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -23,6 +68,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /queries", h.registerQuery)
 	mux.HandleFunc("DELETE /queries/{id}", h.unregisterQuery)
 	mux.HandleFunc("GET /metrics", h.metrics)
+	mux.HandleFunc("GET /stream/events", h.streamEvents)
+	mux.HandleFunc("GET /stream/queries/{id}", h.streamQuery)
 }
 
 func (h *Handler) listQueries(w http.ResponseWriter, r *http.Request) {
@@ -111,8 +158,119 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	m := metrics.Get()
+	if h.quicStats != nil {
+		m["active_clients"] = h.quicStats.ActiveClients()
+	}
+	m["active_queries"] = len(h.manager.List())
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(metrics.Get())
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	_ = json.NewEncoder(w).Encode(m)
+}
+
+func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Connection", "keep-alive")
+
+	sub := &eventSub{ch: make(chan string, 100)}
+	h.eventSubMu.Lock()
+	h.eventSubs[sub] = true
+	h.eventSubMu.Unlock()
+
+	defer func() {
+		h.eventSubMu.Lock()
+		delete(h.eventSubs, sub)
+		h.eventSubMu.Unlock()
+	}()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			queries := h.manager.List()
+			if len(queries) > 0 {
+				data := map[string]interface{}{
+					"ingestion_rate": len(queries) * 10,
+					"timestamp":      time.Now().Format(time.RFC3339),
+				}
+				payload, _ := json.Marshal(data)
+				fmt.Fprintf(w, "data: %s\n\n", payload)
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+func (h *Handler) streamQuery(w http.ResponseWriter, r *http.Request) {
+	queryID := r.PathValue("id")
+	if queryID == "" {
+		http.Error(w, "query id required", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Connection", "keep-alive")
+
+	sub := &querySub{id: queryID, ch: make(chan string, 100)}
+
+	h.querySubMu.Lock()
+	if h.querySubs[queryID] == nil {
+		h.querySubs[queryID] = make(map[*querySub]bool)
+	}
+	h.querySubs[queryID][sub] = true
+	h.querySubMu.Unlock()
+
+	defer func() {
+		h.querySubMu.Lock()
+		delete(h.querySubs[queryID], sub)
+		h.querySubMu.Unlock()
+	}()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	queries := h.manager.List()
+	for _, q := range queries {
+		if q.ID == queryID {
+			data := map[string]interface{}{
+				"id":     q.ID,
+				"sql":    q.SQL,
+				"active": q.Active,
+				"status": "running",
+			}
+			payload, _ := json.Marshal(data)
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
+			break
+		}
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
