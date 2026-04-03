@@ -26,7 +26,12 @@ func NewREPL(ctx context.Context, manager *query.Manager) *REPL {
 }
 
 var (
-	registerRe   = regexp.MustCompile(`(?i)^REGISTER QUERY\s+(\w+)\s+AS\s+(.+)$`)
+	// Supported syntax:
+	// REGISTER QUERY <id> AS <sql>
+	// REGISTER QUERY <id> AS <sql> WITH CURSOR <column>
+	// REGISTER QUERY <id> AS <sql> FROM NOW
+	// REGISTER QUERY <id> AS <sql> WITH CURSOR <column> FROM NOW
+	registerRe   = regexp.MustCompile(`(?i)^REGISTER QUERY\s+(\w+)\s+AS\s+(.+?)(?:\s+WITH\s+CURSOR\s+(\w+))?(?:\s+FROM\s+NOW)?\s*$`)
 	unregisterRe = regexp.MustCompile(`(?i)^UNREGISTER QUERY\s+(\w+)$`)
 	listRe       = regexp.MustCompile(`(?i)^LIST QUERIES$`)
 	helpRe       = regexp.MustCompile(`(?i)^HELP$`)
@@ -78,10 +83,8 @@ func (r *REPL) process(line string) error {
 		return nil
 	}
 
-	if matches := registerRe.FindStringSubmatch(line); matches != nil {
-		id := matches[1]
-		sql := strings.TrimSpace(matches[2])
-		return r.manager.Register(r.ctx, id, sql)
+	if id, sql, cursorHint, mode, ok := parseRegisterCommand(line); ok {
+		return r.manager.Register(r.ctx, id, sql, cursorHint, mode)
 	}
 
 	if matches := unregisterRe.FindStringSubmatch(line); matches != nil {
@@ -103,4 +106,26 @@ func (r *REPL) process(line string) error {
 	}
 
 	return fmt.Errorf("unknown command: %s", line)
+}
+
+func parseRegisterCommand(line string) (id, sql string, cursorHint *string, mode query.StartMode, ok bool) {
+	matches := registerRe.FindStringSubmatch(line)
+	if matches == nil {
+		return "", "", nil, query.StartModeBeginning, false
+	}
+
+	id = matches[1]
+	sql = strings.TrimSpace(matches[2])
+	mode = query.StartModeBeginning
+	cursorHint = nil
+
+	if matches[3] != "" {
+		cursorHint = &matches[3]
+	}
+
+	if strings.Contains(strings.ToUpper(line), "FROM NOW") {
+		mode = query.StartModeNow
+	}
+
+	return id, sql, cursorHint, mode, true
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,8 +96,10 @@ func (h *Handler) listQueries(w http.ResponseWriter, r *http.Request) {
 }
 
 type RegisterRequest struct {
-	ID  string `json:"id"`
-	SQL string `json:"sql"`
+	ID     string `json:"id"`
+	SQL    string `json:"sql"`
+	Cursor string `json:"cursor,omitempty"`
+	Mode   string `json:"mode,omitempty"` // "BEGINNING" or "NOW"
 }
 
 func (h *Handler) registerQuery(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +119,15 @@ func (h *Handler) registerQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.manager.Register(r.Context(), req.ID, req.SQL); err != nil {
+	mode := query.StartModeBeginning
+	if strings.EqualFold(req.Mode, "NOW") || strings.Contains(strings.ToUpper(req.SQL), "FROM NOW") {
+		mode = query.StartModeNow
+	}
+	cursorHint := (*string)(nil)
+	if req.Cursor != "" {
+		cursorHint = &req.Cursor
+	}
+	if err := h.manager.Register(r.Context(), req.ID, req.SQL, cursorHint, mode); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -163,6 +174,28 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 		m["active_clients"] = h.quicStats.ActiveClients()
 	}
 	m["active_queries"] = len(h.manager.List())
+
+	// Per-query streaming metrics
+	queryStates := h.manager.GetAllQueryStates()
+	queryMetrics := make([]map[string]interface{}, 0, len(queryStates))
+	now := time.Now()
+	for id, st := range queryStates {
+		var lagMs interface{}
+		if ts, ok := st.CursorValue.(time.Time); ok && !ts.IsZero() {
+			lagMs = now.Sub(ts).Milliseconds()
+		} else {
+			lagMs = nil
+		}
+
+		queryMetrics = append(queryMetrics, map[string]interface{}{
+			"id":            id,
+			"last_cursor":   st.CursorValue,
+			"rows_streamed": st.RowsSent,
+			"lag_ms":        lagMs,
+		})
+	}
+
+	m["query_metrics"] = queryMetrics
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
