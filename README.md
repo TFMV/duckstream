@@ -1,4 +1,4 @@
-# duckstream
+![Logo](assets/logo.svg)
 
 SQL queries registered in DuckDB become long-running streaming queries, with results continuously streamed over QUIC until explicitly stopped.
 
