@@ -11,7 +11,7 @@ Data → Ingestion → DuckDB → Query Runtime → QUIC → Client
 - **Ingestion Layer**: HTTP POST endpoint receives JSON data, batch inserts into DuckDB `events` table using DuckDB Appender API
 - **Query Runtime**: Manages persistent streaming queries with incremental polling
 - **QUIC Transport**: Streams results to connected clients via QUIC
-- **Control Surface**: REPL for registering/unregistering queries
+- **Control Surface**: REPL + HTTP API + Web Dashboard for registering/unregistering queries
 
 ## Quick Start
 
@@ -24,14 +24,71 @@ go run ./cmd/main.go
 
 # Terminal 2: Run the demo client
 go run ./cmd/demo
+
+# Terminal 3: Open the dashboard
+# Open frontend/index.html in a browser
 ```
 
 The server starts:
 - QUIC server on `localhost:4242`
-- HTTP ingest on `localhost:8080`
+- HTTP API on `localhost:8080`
 - REPL control surface (stdin)
 
-The demo client continuously ingests events every 5 seconds and displays the streaming results in real-time. Press Ctrl+C to stop.
+## HTTP API
+
+```bash
+# List queries
+curl http://localhost:8080/queries
+
+# Register query
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"q1","sql":"SELECT * FROM events"}'
+
+# Unregister query
+curl -X DELETE http://localhost:8080/queries/q1
+
+# Get metrics
+curl http://localhost:8080/metrics
+```
+
+## Features
+
+### Query Validation
+Invalid SQL is rejected before creating an executor:
+```bash
+curl -X POST http://localhost:8080/queries \
+  -H "Content-Type: application/json" \
+  -d '{"id":"bad","sql":"SELECT * FROM nonexistent"}'
+# Returns: invalid query: table does not exist
+```
+
+### Metrics Endpoint
+Tracks:
+- `queries_registered` - total queries registered
+- `queries_unregistered` - total queries unregistered  
+- `rows_sent` - total rows streamed
+- `errors` - total errors
+- `active_clients` - current QUIC connections
+- `active_queries` - current running queries
+
+### Connection Limits (Sane Defaults)
+- Max clients: 100
+- Max streams per client: 10
+- Max queries: 50
+
+### Query-Specific Streams
+Each query gets its own QUIC stream - different queries don't share streams.
+
+## Dashboard
+
+Open `frontend/index.html` in a browser for a live dashboard with:
+- Query Control Panel - register/unregister queries
+- Live Stream Viewer - real-time results for each query
+- Event Ingestion Panel - live feed of events
+- System Status Bar - connection status, uptime, metrics
+
+![Dashboard](assets/spa.png)
 
 ## How It Works
 
@@ -60,17 +117,26 @@ executor         = a background worker that checks for new entries
 QUIC stream      = a delivery channel to the subscriber
 ```
 
-**Example flow:**
-```
-Insert: {"event": "click", "x": 100}
-  → q1 (WHERE event='click')  → delivers to client
-  → q2 (WHERE event='view')  → skips (no match)
-  → q3 (SELECT *)             → delivers to client
-Insert: {"event": "view", "y": 200}
-  → q1 → skips
-  → q2 → delivers
-  → q3 → delivers
-```
+## Configuration
+
+Default configuration in `internal/config/config.go`:
+- `DuckDBPath`: `"duckstream.db"`
+- `QUICAddr`: `"localhost:4242"`
+- `IngestAddr`: `"localhost:8080"`
+- `BatchSize`: `100` - Events per batch
+- `BatchTimeout`: `1s`
+- `PollInterval`: `100ms`
+- `MaxClients`: `100`
+- `MaxStreamsPerClient`: `10`
+- `MaxQueries`: `50`
+
+## REPL Commands
+
+- `REGISTER QUERY <id> AS <sql>` - Start streaming a query
+- `UNREGISTER QUERY <id>` - Stop streaming and remove query
+- `LIST QUERIES` - Show active queries
+- `HELP` - Show help
+- `QUIT` - Exit
 
 ## Behavior
 

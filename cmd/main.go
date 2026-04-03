@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/duckstream/duckstream/internal/config"
 	"github.com/duckstream/duckstream/internal/duckdb"
@@ -55,11 +57,44 @@ func main() {
 	}()
 
 	ingestHandler := duckdb.NewIngestHandler(client, cfg)
-	apiHandler := httpapi.NewHandler(manager)
+	apiHandler := httpapi.NewHandler(manager, quicServer)
 
+	exePath, _ := os.Executable()
+	dir := filepath.Dir(exePath)
+	cwd, _ := os.Getwd()
+	frontendDir := filepath.Join(dir, "frontend")
+	if _, err := os.Stat(frontendDir); os.IsNotExist(err) {
+		frontendDir = filepath.Join(cwd, "frontend")
+		if _, err := os.Stat(frontendDir); os.IsNotExist(err) {
+			frontendDir = "frontend"
+		}
+	}
+
+	fs := http.FileServer(http.Dir(frontendDir))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest", ingestHandler.Handle)
+	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		sql := string(buf[:n])
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.Exec(ctx, sql); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
 	apiHandler.RegisterRoutes(mux)
+	mux.HandleFunc("/frontend/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+	})
+	mux.Handle("/", fs)
 
 	go func() {
 		log.Printf("HTTP server listening on %s", cfg.IngestAddr)
@@ -80,5 +115,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	_ = repl.NewREPL(ctx, manager).Run()
+	go func() {
+		_ = repl.NewREPL(ctx, manager).Run()
+	}()
+
+	<-ctx.Done()
 }

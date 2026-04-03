@@ -11,12 +11,13 @@
 # Test binary, built with `go test -c`
 *.test
 duckstream.db
+duckstream.db-wal
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
 *.coverprofile
 profile.cov
-
+.DS_Store
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

@@ -72,7 +72,7 @@ func (m *Manager) Register(ctx context.Context, id, sql string) error {
 }
 
 func (m *Manager) validateSQL(sql string) error {
-	rows, err := m.client.DB().QueryContext(context.Background(), "SELECT 1 WHERE ("+sql+") LIMIT 0")
+	rows, err := m.client.DB().QueryContext(context.Background(), sql+" LIMIT 0")
 	if err != nil {
 		return fmt.Errorf("invalid SQL: %v", err)
 	}
