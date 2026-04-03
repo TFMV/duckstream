@@ -7,6 +7,7 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/duckstream/duckstream/internal/metrics"
 )
 
 type Client struct {
@@ -39,6 +40,14 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS events (
 		id BIGINT DEFAULT (nextval('events_id_seq')),
 		data JSON,
+		timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (id)
+	);
+	CREATE SEQUENCE IF NOT EXISTS ingestion_events_id_seq;
+	CREATE TABLE IF NOT EXISTS ingestion_events (
+		id BIGINT DEFAULT (nextval('ingestion_events_id_seq')),
+		table_name TEXT NOT NULL,
+		data TEXT,
 		timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (id)
 	);
@@ -89,7 +98,11 @@ func (c *Client) InsertEvents(ctx context.Context, events []Event) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	metrics.IncIngestedRows(int64(len(events)))
+	return nil
 }
 
 func (c *Client) MaxEventID(ctx context.Context) (int64, error) {
@@ -176,5 +189,15 @@ func (c *Client) InsertRow(ctx context.Context, tableName, data string) error {
 		return fmt.Errorf("insert: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	metrics.IncIngestedRows(1)
+	return nil
+}
+
+func (c *Client) LogIngestionEvent(ctx context.Context, tableName, data string) error {
+	insertSQL := "INSERT INTO ingestion_events (table_name, data, timestamp) VALUES (?, ?, ?)"
+	_, err := c.db.ExecContext(ctx, insertSQL, tableName, data, time.Now())
+	return err
 }

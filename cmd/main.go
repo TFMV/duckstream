@@ -57,7 +57,7 @@ func main() {
 	}()
 
 	ingestHandler := duckdb.NewIngestHandler(client, cfg)
-	apiHandler := httpapi.NewHandler(manager, quicServer)
+	apiHandler := httpapi.NewHandler(manager, client, quicServer)
 
 	exePath, _ := os.Executable()
 	dir := filepath.Dir(exePath)
