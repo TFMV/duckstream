@@ -5,45 +5,39 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
-var eventCounter int
-
 func main() {
 	fmt.Println("DuckStream Demo Client")
 	fmt.Println("========================")
 	fmt.Println()
-	fmt.Println("Prerequisites:")
-	fmt.Println("1. Start the server: go run ./cmd/main.go")
-	fmt.Println("2. In the server REPL, register a query: REGISTER QUERY q1 AS SELECT * FROM events")
-	fmt.Println("3. Run this demo in another terminal: go run ./cmd/demo")
-	fmt.Println()
 	fmt.Println("This demo will:")
-	fmt.Println("  - Continuously ingest events every 5 seconds")
-	fmt.Println("  - Connect to QUIC and display streaming results")
-	fmt.Println("  - Press Ctrl+C to stop")
+	fmt.Println("  1. Create a 'lineitem' table in the server's DuckDB")
+	fmt.Println("  2. Register a streaming query: SELECT * FROM lineitem")
+	fmt.Println("  3. Continuously insert rows every 2 seconds")
+	fmt.Println("  4. Display streamed results over QUIC")
 	fmt.Println()
-
-	if len(os.Args) > 1 && os.Args[1] == "--help" {
-		return
-	}
+	fmt.Println("Run this AFTER starting the server:")
+	fmt.Println("  go run ./cmd/main.go")
+	fmt.Println()
+	fmt.Println("Then in another terminal:")
+	fmt.Println("  go run ./cmd/demo")
+	fmt.Println()
 
 	ctx := context.Background()
 
 	go receiveFromQUIC(ctx)
-	go continuousIngest(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
-	fmt.Println("=== Starting continuous event ingestion (every 5 seconds) ===")
+	go setupAndInsert(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -51,38 +45,78 @@ func main() {
 	fmt.Println("\nStopping demo...")
 }
 
-func continuousIngest(ctx context.Context) {
-	client := &http.Client{}
+func setupAndInsert(ctx context.Context) {
+	httpClient := &http.Client{}
 
-	events := []string{
-		`{"event":"click","x":100,"y":200}`,
-		`{"event":"view","page":"/home"}`,
-		`{"event":"click","x":150,"y":250}`,
-		`{"event":"scroll","position":500}`,
-		`{"event":"click","x":300,"y":400}`,
-		`{"event":"view","page":"/about"}`,
-		`{"event":"click","x":50,"y":100}`,
-		`{"event":"scroll","position":1000}`,
-		`{"event":"view","page":"/contact"}`,
-		`{"event":"click","x":400,"y":300}`,
+	time.Sleep(500 * time.Millisecond)
+
+	fmt.Println("=== Step 1: Creating 'lineitem' table ===")
+	resp, err := httpClient.Post("http://localhost:8080/exec", "text/plain", nil)
+	if err != nil {
+		log.Printf("Error creating table: %v", err)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Printf("CREATE TABLE: %s\n", string(body))
+
+	time.Sleep(200 * time.Millisecond)
+
+	execReq, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader("CREATE SEQUENCE IF NOT EXISTS lineitem_id_seq"))
+	execReq.Header.Set("Content-Type", "text/plain")
+	resp, err = httpClient.Do(execReq)
+	if err == nil {
+		resp.Body.Close()
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
+	execReq2, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader("CREATE TABLE IF NOT EXISTS lineitem (id BIGINT DEFAULT (nextval('lineitem_id_seq')), name TEXT, price DECIMAL(10,2), quantity INTEGER, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+	execReq2.Header.Set("Content-Type", "text/plain")
+	resp, err = httpClient.Do(execReq2)
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	fmt.Println("=== Step 2: Registering streaming query ===")
+	queryReq, _ := http.NewRequest("POST", "http://localhost:8080/queries", strings.NewReader(`{"id":"lineitem_stream","sql":"SELECT * FROM lineitem ORDER BY id"}`))
+	queryReq.Header.Set("Content-Type", "application/json")
+	resp, err = httpClient.Do(queryReq)
+	if err != nil {
+		log.Printf("Error registering query: %v", err)
+		return
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Printf("REGISTER QUERY: %s\n", string(body))
+
+	fmt.Println("=== Step 3: Starting continuous inserts (every 2 seconds) ===")
+	fmt.Println("Watch for streamed results in the QUIC output above!")
+	fmt.Println()
+
+	items := []map[string]interface{}{
+		{"name": "Widget", "price": 19.99, "quantity": 100},
+		{"name": "Gadget", "price": 29.99, "quantity": 50},
+		{"name": "Gizmo", "price": 9.99, "quantity": 200},
+		{"name": "Doohickey", "price": 49.99, "quantity": 25},
+		{"name": "Thingamajig", "price": 14.99, "quantity": 150},
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	counter := 0
 	for range ticker.C {
-		eventCounter++
-		e := events[eventCounter%len(events)]
-		data := map[string]string{"data": e}
-		jsonBytes, _ := json.Marshal(data)
-		resp, err := client.Post("http://localhost:8080/ingest", "application/json", nil)
-		if err != nil {
-			log.Printf("Error: %v", err)
-			continue
+		counter++
+		item := items[counter%len(items)]
+
+		execReq, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader(fmt.Sprintf("INSERT INTO lineitem (name, price, quantity) VALUES ('%s', %v, %d)", item["name"], item["price"], item["quantity"])))
+		execReq.Header.Set("Content-Type", "text/plain")
+		resp, err = httpClient.Do(execReq)
+		if err == nil {
+			resp.Body.Close()
+			fmt.Printf("[%s] INSERTED: %s (price: $%.2f, qty: %d)\n", time.Now().Format("15:04:05"), item["name"], item["price"], item["quantity"])
 		}
-		fmt.Printf("[%s] Ingested: %s -> %d\n", time.Now().Format("15:04:05"), e, resp.StatusCode)
-		resp.Body.Close()
-		_ = jsonBytes
 	}
 }
 
@@ -95,7 +129,7 @@ func receiveFromQUIC(ctx context.Context) {
 	conn, err := quic.DialAddr(ctx, "localhost:4242", tlsConf, nil)
 	if err != nil {
 		log.Printf("QUIC connection failed: %v", err)
-		fmt.Println("Make sure the server is running and you have registered a query!")
+		fmt.Println("Make sure the server is running!")
 		return
 	}
 	defer func() { _ = conn.CloseWithError(0, "") }()
@@ -107,7 +141,8 @@ func receiveFromQUIC(ctx context.Context) {
 	}
 	defer stream.Close()
 
-	fmt.Println("=== Connected to QUIC, waiting for results ===")
+	fmt.Println("=== QUIC Connected - Waiting for streamed rows ===")
+	fmt.Println()
 
 	buf := make([]byte, 4096)
 	for {
@@ -137,7 +172,7 @@ func parseMessage(data []byte) {
 			return
 		}
 		for _, row := range rows {
-			fmt.Printf("[%s] Row: %v\n", time.Now().Format("15:04:05"), row)
+			fmt.Printf("[%s] STREAMED: %v\n", time.Now().Format("15:04:05"), row)
 		}
 	case 0x02:
 		fmt.Println("Query completed")
