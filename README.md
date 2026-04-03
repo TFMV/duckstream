@@ -9,7 +9,7 @@ Data → Ingestion → DuckDB → Query Runtime → QUIC → Client
 ```
 
 - **Ingestion Layer**: HTTP POST endpoint receives JSON data, batch inserts into DuckDB `events` table using DuckDB Appender API
-- **Query Runtime**: Manages persistent streaming queries with incremental polling
+- **Query Runtime**: Manages persistent streaming queries with incremental polling across any table that exposes a cursor column (`id` BIGINT or `created_at` TIMESTAMP)
 - **QUIC Transport**: Streams results to connected clients via QUIC
 - **Control Surface**: REPL + HTTP API + Web Dashboard for registering/unregistering queries
 
@@ -19,14 +19,11 @@ Data → Ingestion → DuckDB → Query Runtime → QUIC → Client
 # Terminal 1: Start the server
 go run ./cmd/main.go
 
-# In the server REPL, register a query:
-> REGISTER QUERY q1 AS SELECT * FROM events
-
 # Terminal 2: Run the demo client
 go run ./cmd/demo
 
 # Terminal 3: Open the dashboard
-# Open frontend/index.html in a browser
+# Open localhost:8080/frontend/index.html in a browser
 ```
 
 The server starts:
@@ -56,6 +53,10 @@ curl http://localhost:8080/metrics
 
 ### SQL Query Validation
 Queries are validated against strict rules at registration time. Invalid SQL is rejected before creating an executor with explicit error messages:
+
+- Queries may target any table (not limited to `events`), as long as table has a valid cursor column:
+  - `id` (BIGINT), or
+  - `created_at` (TIMESTAMP)
 
 ```bash
 # Single-table queries only
