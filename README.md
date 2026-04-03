@@ -99,7 +99,7 @@ curl http://localhost:8080/metrics | jq .
 ```
 
 Response includes:
-- Global metrics: `queries_registered`, `queries_unregistered`, `rows_sent`, `errors`
+- Global metrics: `queries_registered`, `queries_unregistered`, `rows_sent`, `errors`, `ingested_rows`
 - Connection stats: `active_clients`, `active_queries`
 - Per-query metrics (array):
   - `id` - query identifier

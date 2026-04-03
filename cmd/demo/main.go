@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -69,7 +70,7 @@ func setupAndInsert(ctx context.Context) {
 		resp.Body.Close()
 	}
 
-	execReq2, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader("CREATE TABLE IF NOT EXISTS lineitem (id BIGINT DEFAULT (nextval('lineitem_id_seq')), name TEXT, price DECIMAL(10,2), quantity INTEGER, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+	execReq2, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader("CREATE TABLE IF NOT EXISTS lineitem (id BIGINT DEFAULT (nextval('lineitem_id_seq')), data JSON, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
 	execReq2.Header.Set("Content-Type", "text/plain")
 	resp, err = httpClient.Do(execReq2)
 	if err == nil {
@@ -79,7 +80,7 @@ func setupAndInsert(ctx context.Context) {
 	time.Sleep(200 * time.Millisecond)
 
 	fmt.Println("=== Step 2: Registering streaming query ===")
-	queryReq, _ := http.NewRequest("POST", "http://localhost:8080/queries", strings.NewReader(`{"id":"lineitem_stream","sql":"SELECT * FROM lineitem ORDER BY id"}`))
+	queryReq, _ := http.NewRequest("POST", "http://localhost:8080/queries", strings.NewReader(`{"id":"lineitem_stream","sql":"SELECT id, data->>'name' as name, CAST(data->>'price' AS DECIMAL(10,2)) as price, CAST(data->>'quantity' AS INTEGER) as quantity, timestamp FROM lineitem ORDER BY id"}`))
 	queryReq.Header.Set("Content-Type", "application/json")
 	resp, err = httpClient.Do(queryReq)
 	if err != nil {
@@ -110,12 +111,21 @@ func setupAndInsert(ctx context.Context) {
 		counter++
 		item := items[counter%len(items)]
 
-		execReq, _ := http.NewRequest("POST", "http://localhost:8080/exec", strings.NewReader(fmt.Sprintf("INSERT INTO lineitem (name, price, quantity) VALUES ('%s', %v, %d)", item["name"], item["price"], item["quantity"])))
-		execReq.Header.Set("Content-Type", "text/plain")
-		resp, err = httpClient.Do(execReq)
+		// Use the ingest endpoint instead of exec for proper logging
+		itemData := map[string]interface{}{
+			"name":     item["name"],
+			"price":    item["price"],
+			"quantity": item["quantity"],
+		}
+		jsonData, _ := json.Marshal(itemData)
+		requestBody := map[string]string{"data": string(jsonData)}
+		requestJSON, _ := json.Marshal(requestBody)
+		ingestReq, _ := http.NewRequest("POST", "http://localhost:8080/ingest/lineitem", bytes.NewReader(requestJSON))
+		ingestReq.Header.Set("Content-Type", "application/json")
+		resp, err = httpClient.Do(ingestReq)
 		if err == nil {
 			resp.Body.Close()
-			fmt.Printf("[%s] INSERTED: %s (price: $%.2f, qty: %d)\n", time.Now().Format("15:04:05"), item["name"], item["price"], item["quantity"])
+			fmt.Printf("[%s] INGESTED: %s (price: $%.2f, qty: %d)\n", time.Now().Format("15:04:05"), item["name"], item["price"], item["quantity"])
 		}
 	}
 }

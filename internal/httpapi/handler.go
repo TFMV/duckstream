@@ -9,12 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/duckstream/duckstream/internal/duckdb"
 	"github.com/duckstream/duckstream/internal/metrics"
 	"github.com/duckstream/duckstream/internal/query"
 )
 
 type Handler struct {
 	manager   *query.Manager
+	client    *duckdb.Client
 	quicStats interface{ ActiveClients() int }
 
 	eventSubs  map[*eventSub]bool
@@ -32,9 +34,10 @@ type querySub struct {
 	ch chan string
 }
 
-func NewHandler(manager *query.Manager, quicStats interface{ ActiveClients() int }) *Handler {
+func NewHandler(manager *query.Manager, client *duckdb.Client, quicStats interface{ ActiveClients() int }) *Handler {
 	h := &Handler{
 		manager:   manager,
+		client:    client,
 		quicStats: quicStats,
 		eventSubs: make(map[*eventSub]bool),
 		querySubs: make(map[string]map[*querySub]bool),
@@ -69,6 +72,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /queries", h.registerQuery)
 	mux.HandleFunc("DELETE /queries/{id}", h.unregisterQuery)
 	mux.HandleFunc("GET /metrics", h.metrics)
+	mux.HandleFunc("GET /ingestion/events", h.ingestionEvents)
 	mux.HandleFunc("GET /stream/events", h.streamEvents)
 	mux.HandleFunc("GET /stream/queries/{id}", h.streamQuery)
 }
@@ -200,6 +204,66 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	_ = json.NewEncoder(w).Encode(m)
+}
+
+func (h *Handler) ingestionEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if h.client == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":  "client is nil",
+			"events": []map[string]interface{}{},
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Query recent ingestion events (last 50)
+	rows, err := h.client.DB().QueryContext(ctx, `
+		SELECT table_name, data, timestamp
+		FROM ingestion_events
+		ORDER BY timestamp DESC
+		LIMIT 50
+	`)
+	if err != nil {
+		// For debugging, return the error
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":  err.Error(),
+			"events": []map[string]interface{}{},
+		})
+		return
+	}
+	defer rows.Close()
+
+	var events = make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var tableName string
+		var data string
+		var timestamp time.Time
+		if err := rows.Scan(&tableName, &data, &timestamp); err != nil {
+			continue
+		}
+		events = append(events, map[string]interface{}{
+			"table":     tableName,
+			"data":      data,
+			"timestamp": timestamp,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"events": events,
+	})
 }
 
 func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request) {

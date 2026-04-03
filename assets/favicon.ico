@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Background circle (subtle) -->
+  <circle cx="100" cy="100" r="95" fill="#26334A" />
+
+  <!-- Duck head -->
+  <ellipse cx="115" cy="95" rx="48" ry="50" fill="#FFCB1F" stroke="#26334A" stroke-width="12" />
+
+  <!-- Duck body (slightly visible for shape) -->
+  <ellipse cx="68" cy="125" rx="38" ry="32" fill="#FFCB1F" stroke="#26334A" stroke-width="10" />
+
+  <!-- Beak (bright orange) -->
+  <polygon points="155,88 185,98 155,108" fill="#FF7F00" stroke="#26334A" stroke-width="6" />
+
+  <!-- Eye -->
+  <circle cx="130" cy="82" r="13" fill="#FEFEFE" />
+  <circle cx="132" cy="82" r="6" fill="#26334A" />
+
+  <!-- Highlight on eye -->
+  <circle cx="128" cy="78" r="3" fill="#FFFFFF" />
+</svg>

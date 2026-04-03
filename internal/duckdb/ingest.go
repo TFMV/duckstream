@@ -3,6 +3,7 @@ package duckdb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -62,6 +63,12 @@ func (h *IngestHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			h.flush()
 		}
 
+		// Log ingestion event
+		if err := h.client.LogIngestionEvent(r.Context(), "events", req.Data); err != nil {
+			// Log error but don't fail the request
+			fmt.Printf("Failed to log ingestion event: %v\n", err)
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 		return
@@ -86,6 +93,12 @@ func (h *IngestHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	if err := h.client.InsertRow(ctx, table, req.Data); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Log ingestion event
+	if err := h.client.LogIngestionEvent(ctx, table, req.Data); err != nil {
+		// Log error but don't fail the request
+		fmt.Printf("Failed to log ingestion event: %v\n", err)
 	}
 
 	w.WriteHeader(http.StatusOK)

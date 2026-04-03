@@ -320,6 +320,12 @@
             margin-bottom: 4px;
         }
         
+        .event-table {
+            color: #58a6ff;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        
         .event-data {
             color: #7ee787;
             font-family: monospace;
@@ -409,7 +415,8 @@
                 rows_sent: 0,
                 errors: 0,
                 active_clients: 0,
-                active_queries: 0
+                active_queries: 0,
+                ingested_rows: 0
             });
             const [connected, setConnected] = useState(false);
             const [startTime] = useState(new Date());
@@ -418,6 +425,7 @@
             const [queryData, setQueryData] = useState({});
             const [eventFeed, setEventFeed] = useState([]);
             const [ingestionRate, setIngestionRate] = useState(0);
+            const lastIngestedRef = useRef(0);
             
             const metricsRef = useRef(null);
             
@@ -426,6 +434,14 @@
                 const interval = setInterval(fetchMetrics, 1000);
                 return () => clearInterval(interval);
             }, []);
+            
+            useEffect(() => {
+                if (metrics.ingested_rows !== undefined) {
+                    const diff = metrics.ingested_rows - lastIngestedRef.current;
+                    setIngestionRate(Math.max(0, diff));
+                    lastIngestedRef.current = metrics.ingested_rows;
+                }
+            }, [metrics.ingested_rows]);
             
             useEffect(() => {
                 fetchQueries();
@@ -537,29 +553,22 @@
                 }));
             };
             
-            const addEvent = useCallback((event) => {
-                setEventFeed(prev => [event, ...prev].slice(0, 50));
+            useEffect(() => {
+                fetchIngestionEvents();
+                const interval = setInterval(fetchIngestionEvents, 2000);
+                return () => clearInterval(interval);
             }, []);
             
-            useEffect(() => {
-                const interval = setInterval(() => {
-                    if (queries.length > 0) {
-                        const newEvent = {
-                            timestamp: new Date().toISOString(),
-                            data: JSON.stringify({
-                                event: ['click', 'view', 'scroll'][Math.floor(Math.random() * 3)],
-                                x: Math.floor(Math.random() * 500),
-                                y: Math.floor(Math.random() * 500)
-                            })
-                        };
-                        addEvent(newEvent);
-                        setIngestionRate(Math.floor(Math.random() * 20) + 5);
-                    }
-                }, 1000);
-                
-                return () => clearInterval(interval);
-            }, [queries.length, addEvent]);
-            
+            const fetchIngestionEvents = async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/ingestion/events`);
+                    const data = await res.json();
+                    const events = data.events || [];
+                    setEventFeed(events.slice(0, 50));
+                } catch (e) {
+                    console.error('Failed to fetch ingestion events:', e);
+                }
+            };
             const uptime = Math.floor((new Date() - startTime) / 1000);
             const formatUptime = (s) => {
                 const h = Math.floor(s / 3600);
@@ -653,6 +662,7 @@
                                 {eventFeed.map((e, i) => (
                                     <div key={i} className="event-item">
                                         <div className="event-time">{new Date(e.timestamp).toLocaleTimeString()}</div>
+                                        <div className="event-table">{e.table}</div>
                                         <div className="event-data">{e.data}</div>
                                     </div>
                                 ))}
@@ -664,7 +674,7 @@
                                     <div className="stat-label">Events/sec</div>
                                 </div>
                                 <div className="stat-card">
-                                    <div className="stat-value">{eventFeed.length}</div>
+                                    <div className="stat-value">{metrics.ingested_rows || 0}</div>
                                     <div className="stat-label">Total Events</div>
                                 </div>
                             </div>
