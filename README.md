@@ -47,6 +47,16 @@ curl -X DELETE http://localhost:8080/queries/q1
 
 # Get metrics
 curl http://localhost:8080/metrics
+
+# Ingest into default events table (log pipeline)
+curl -X POST http://localhost:8080/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"data":"{\"user_id\":123}"}'
+
+# Ingest into specific table
+curl -X POST http://localhost:8080/ingest/lineitem \
+  -H "Content-Type: application/json" \
+  -d '{"data":"{\"item\":\"apple\"}"}'
 ```
 
 ## Features
