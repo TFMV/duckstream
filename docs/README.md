@@ -28,6 +28,6 @@ For high-throughput scenarios, consider:
 
 | Topic | Description |
 |-------|-------------|
-| [Architecture](./docs/architecture.md) | Deep dive into system design |
-| [API](./docs/api.md) | HTTP API endpoints and examples |
-| [Queries](./docs/queries.md) | SQL query patterns and best practices |
+| [Architecture](architecture.md) | Deep dive into system design |
+| [API](api.md) | HTTP API endpoints and examples |
+| [Queries](queries.md) | SQL query patterns and best practices |
